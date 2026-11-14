@@ -8,11 +8,12 @@ set -e
 
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ONBOARD_WS="${WORKSPACE_DIR}/onboard_ws"
-IMAGE_NAME="osrf/ros:humble-desktop"
+IMAGE_NAME="${HAIQUE_IMAGE:-osrf/ros:humble-desktop}"
 
 echo "=========================================================="
-echo "🔨 正在调用 ROS 2 Humble 容器编译 onboard_ws ..."
-echo "📂 工作区目录: ${ONBOARD_WS}"
+echo "正在调用 ROS 2 Humble 容器编译 onboard_ws ..."
+echo "工作区目录: ${ONBOARD_WS}"
+echo "使用镜像: ${IMAGE_NAME}"
 echo "=========================================================="
 
 docker run --rm \
@@ -29,6 +30,6 @@ else
 fi
 
 echo "=========================================================="
-echo "✅ 编译成功！"
-echo "💡 快速测试运行: ./docker/run_mock_loop.sh"
+echo "编译成功。"
+echo "快速测试运行: ./docker/run_mock_loop.sh"
 echo "=========================================================="

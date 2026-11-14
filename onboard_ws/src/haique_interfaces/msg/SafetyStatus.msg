@@ -1,4 +1,8 @@
 # 海雀机载系统 - 状态与安全监控消息
+#
+# 本话题的唯一发布者是 policy_runner_node。为防止 DDS 双发布者互相覆盖，
+# 未来真正发送 setpoint 的节点若要上报 offboard_enabled，不得与 policy 同时
+# 发布本话题，应改用独立话题或服务。
 
 std_msgs/Header header
 
@@ -6,11 +10,19 @@ std_msgs/Header header
 bool is_safe
 
 # 是否处于强化学习 Offboard 控制激活状态
+# 所有权属于 px4_rates_bridge: 只有真正向 PX4 发送 setpoint 时才可置 true。
+# policy_runner_node 恒置 false，避免在未接管飞控时谎报已 Offboard。
 bool offboard_enabled
 
 # 是否触发紧急停车/返航/抢权
+# 仅 "OBS_TIMEOUT" 与 "PIPELINE_EXCEPTION" 两类真故障置 true;
+# 非有限输入与降级模式已输出安全动作，不算紧急。
+# OBS_TIMEOUT 期间 policy_runner_node 会以 20Hz 主动向 /haique/policy_action
+# 下发悬停安全动作 (零角速度 + 限幅后的悬停推力)，让看门狗执行动作。
+# 仅在此前收到过观测后生效，纯上电阶段不下发，避免向飞控灌 setpoint。
 bool emergency_triggered
 
-# 状态码或诊断提示 (如 "NORMAL", "RC_OVERRIDE", "OBSERVATION_TIMEOUT", "EXCESSIVE_TILT")
+# 状态码或诊断提示 (如 "NORMAL", "WAITING_OBSERVATION", "BASELINE_FALLBACK",
+# "NONFINITE_OBSERVATION", "NONFINITE_ACTION", "OBS_TIMEOUT", "PIPELINE_EXCEPTION")
 string status_code
 string message

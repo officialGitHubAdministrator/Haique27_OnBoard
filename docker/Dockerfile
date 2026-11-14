@@ -38,22 +38,12 @@ RUN git clone -b v2.4.1 https://github.com/eProsima/Micro-XRCE-DDS-Agent.git /tm
     && ldconfig /usr/local/lib/ \
     && rm -rf /tmp/Micro-XRCE-DDS-Agent
 
-# 配置用户与工作区权限 (匹配宿主机用户 UID=1000)
-ARG USERNAME=wang
-ARG USER_UID=1000
-ARG USER_GID=1000
-
-RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
-    && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
-    && chmod 0440 /etc/sudoers.d/$USERNAME
-
+# 与 docker/*.sh 保持一致：脚本以 root 运行并挂载工作区到 /root/ros2_ws。
 # 自动 source ROS 2 环境
-RUN echo "source /opt/ros/humble/setup.bash" >> /home/$USERNAME/.bashrc \
-    && echo "if [ -f /root/ros2_ws/install/setup.bash ]; then source /root/ros2_ws/install/setup.bash; fi" >> /home/$USERNAME/.bashrc \
-    && echo "if [ -f /home/$USERNAME/ros2_ws/install/setup.bash ]; then source /home/$USERNAME/ros2_ws/install/setup.bash; fi" >> /home/$USERNAME/.bashrc
+RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc \
+    && echo "if [ -f /root/ros2_ws/install/setup.bash ]; then source /root/ros2_ws/install/setup.bash; fi" >> /root/.bashrc
 
-USER $USERNAME
-WORKDIR /home/$USERNAME/ros2_ws
+USER root
+WORKDIR /root/ros2_ws
 
 CMD ["/bin/bash"]

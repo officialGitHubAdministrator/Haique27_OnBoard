@@ -1,23 +1,21 @@
-# 海雀机载系统 - 17维统一观测向量消息定义
-# 坐标系说明: 所有机体物理量均转换至 FLU (前-左-上, Front-Left-Up) 机体系
+# 海雀机载系统 17 维观测消息（50Hz）
+# 所有物理量均在 FLU 机体系（前-左-上）下表达。
+# 17 维扁平向量的拼装顺序见 docs/DESIGN.md，由 policy_runner_node 统一负责。
 
+# header.frame_id 当前不做校验，仅透传；契约以 FLU 机体系为准。
 std_msgs/Header header
 
-# 1. 目标点在机体系下的相对位置误差 (单位: m) [3维]
-geometry_msgs/Point rel_position_error
-
-# 2. 机体当前姿态四元数 (FLU系机体相对于地面参考系) [4维, w, x, y, z]
+# 姿态四元数 [w, x, y, z]，机体坐标系到世界坐标系
 geometry_msgs/Quaternion orientation
 
-# 3. 机体线速度 (FLU系, 单位: m/s) [3维]
+# 机体系线速度 (m/s)
 geometry_msgs/Vector3 body_linear_velocity
 
-# 4. 机体角速度 (FLU系, 单位: rad/s) [3维]
+# 机体系角速度 (rad/s)
 geometry_msgs/Vector3 body_angular_velocity
 
-# 5. 上一时刻策略动作 (3轴角速度 + 标一化推力) [4维]
-float32[4] last_action
+# 目标点在机体系下的相对位置误差 (m)：目标点 - 当前点
+geometry_msgs/Point rel_position_error
 
-# 6. 扁平化 17 维连续数组 (方便直接转换张量输入 ONNX/TensorRT 模型)
-# 对应拼接顺序: [rel_pos(3), quat(4), lin_vel(3), ang_vel(3), last_action(4)]
-float32[17] flat_obs
+# 上一步实际下发的动作：[roll_rate, pitch_rate, yaw_rate, thrust]
+float32[4] last_action

@@ -8,11 +8,12 @@ set -e
 
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ONBOARD_WS="${WORKSPACE_DIR}/onboard_ws"
-IMAGE_NAME="osrf/ros:humble-desktop"
+IMAGE_NAME="${HAIQUE_IMAGE:-osrf/ros:humble-desktop}"
 
 echo "=========================================================="
-echo "🚀 正在启动 50Hz 零硬件依赖闭环测试 (Docker 容器内)"
-echo "💡 按 Ctrl+C 可停止测试"
+echo "正在启动 50Hz 零硬件依赖闭环测试 (Docker 容器内)"
+echo "使用镜像: ${IMAGE_NAME}"
+echo "按 Ctrl+C 可停止测试"
 echo "=========================================================="
 
 docker run --rm -it \
