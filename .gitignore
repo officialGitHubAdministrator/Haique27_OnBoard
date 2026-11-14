@@ -1,0 +1,8 @@
+onboard_ws/build/
+onboard_ws/install/
+onboard_ws/log/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+*.egg-info/
