@@ -28,9 +28,9 @@ from launch_ros.parameter_descriptions import ParameterValue
 # 两个节点必须使用同一个悬停推力: mock 用它作为 last_action 初值，
 # policy_runner 用它作为兜底动作与内置控制器的基准。
 # 两者不一致会引入稳态偏差。
-# 0.58 没有实测依据，仅保持既有行为不变; 真机前必须按 tau_hover = m*g / T_max
-# 重新标定，当前硬件约为 0.13。若标定值低于 min_thrust，兜底推力会被夹到
-# min_thrust，需要同步下调 min_thrust。
+# 0.58 没有实测依据，只用于 mock/台架; 真机前必须按 tau_hover = m*g / T_max
+# 标定并显式传入，当前硬件约为 0.13。若标定值低于 min_thrust，
+# policy_runner 启动时会拒绝运行，需要同步下调 min_thrust。
 HOVER_THRUST = 0.58
 
 

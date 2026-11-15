@@ -26,8 +26,8 @@ class MockTelemetryPublisher(Node):
         super().__init__('mock_telemetry_publisher')
 
         # 参数先声明、校验，再创建定时器：非法配置 fail-fast，不留下半启动状态。
-        # 注意：hover_thrust 默认值 0.58 没有实测依据，仅保持既有行为不变。
-        # 真机前需按 tau_hover = m*g / T_max 重新标定，当前硬件约 0.13。
+        # 注意：hover_thrust 默认值 0.58 没有实测依据，只用于 mock/台架。
+        # 真机前需按 tau_hover = m*g / T_max 标定并显式传入，当前硬件约 0.13。
         try:
             self.declare_parameter('frequency_hz', 50.0)
         except InvalidParameterTypeException as exc:
@@ -45,7 +45,7 @@ class MockTelemetryPublisher(Node):
         self.hover_thrust = hover_thrust
 
         # 上一步动作反馈的初值：角速度为 0，推力取悬停值。
-        # 之后由 /haique/policy_action 回调整表替换，不在原地修改。
+        # 这是初始猜测，不是任何一帧真实动作；之后由 /haique/policy_action 回调整表替换。
         self.last_action = [0.0, 0.0, 0.0, self.hover_thrust]
         # 最近一次有效动作到达的 ROS 时钟纳秒；None 表示从未收到。
         self.last_action_ns = None
@@ -130,7 +130,9 @@ class MockTelemetryPublisher(Node):
                 )
 
         msg = DroneObservation()
+        # mock 没有真实传感器，stamp 取发布时刻；真实估计器必须填采样时刻。
         msg.header.stamp = now.to_msg()
+        # 观测契约要求 frame_id 必须是 base_link_flu。
         msg.header.frame_id = 'base_link_flu'
 
         # 1. 模拟目标相对位置误差 (模拟无人机在 3D 空间微小飘动逼近目标点)

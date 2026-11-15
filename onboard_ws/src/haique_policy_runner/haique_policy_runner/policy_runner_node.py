@@ -5,7 +5,7 @@
 核心功能:
   1. 订阅 50Hz 观测 /haique/observation，在唯一入口拼装 17 维策略输入;
   2. 调用 ONNX Runtime 或内置基准控制器前向推理;
-  3. 观测与推理结果做非有限值防护，动作做角速度与推力限幅;
+  3. 观测契约（frame_id/四元数模长）与非有限值防护，动作做角速度与推力限幅;
   4. 发布 4 维动作 /haique/policy_action 与健康状态 /haique/safety_status;
   5. 观测丢包看门狗: 超过 watchdog_timeout_s 无新观测即报告 OBS_TIMEOUT;
   6. OBS_TIMEOUT 期间以 20Hz 主动下发悬停安全动作，看门狗真正执行动作，
@@ -23,24 +23,26 @@ import sys
 import time
 
 import rclpy
+from rclpy.exceptions import ParameterException
 from rclpy.node import Node
 from geometry_msgs.msg import Vector3
 from haique_interfaces.msg import DroneObservation, PolicyAction, SafetyStatus
 
-# onnxruntime 只在指定了 model_path 时才必需，默认路径下节点零第三方依赖。
-try:
-    import numpy as np
-    import onnxruntime as ort
-    HAS_ONNX = True
-except ImportError:
-    np = None
-    ort = None
-    HAS_ONNX = False
+# onnxruntime 只在指定 model_path 时按需导入，默认路径下节点零第三方依赖。
+# 导入失败在 _import_onnx_runtime 里转成带上下文的 RuntimeError。
 
 
 OBS_DIM = 17                    # 冻结的观测维度，顺序见 DroneObservation.msg
 ACTION_DIM = 4                  # [roll_rate, pitch_rate, yaw_rate, thrust]
 MAX_E2E_LATENCY_MS = 1000.0     # 端到端延迟上界，超出视为时间戳不可信
+
+# 0.58 没有实测依据，只是沿用旧值；仅用于 mock/台架，真机必须显式标定。
+HOVER_THRUST_DEFAULT = 0.58
+
+# 观测与动作统一使用的机体系 frame_id；观测若来自 PX4 的 FRD 数据必须先转换。
+BODY_FRAME_ID = 'base_link_flu'
+# 四元数模长容差；超出视为观测违反契约，不能送进网络。
+QUATERNION_NORM_TOLERANCE = 1e-2
 
 # 引擎模式: 决定"当前到底在跑网络还是内置基准控制器"。
 ENGINE_ONNX = 'ONNX'
@@ -51,6 +53,7 @@ STATUS_WAITING = 'WAITING_OBSERVATION'
 STATUS_NORMAL = 'NORMAL'
 STATUS_BASELINE_FALLBACK = 'BASELINE_FALLBACK'
 STATUS_NONFINITE_OBSERVATION = 'NONFINITE_OBSERVATION'
+STATUS_INVALID_OBSERVATION = 'INVALID_OBSERVATION'
 STATUS_NONFINITE_ACTION = 'NONFINITE_ACTION'
 STATUS_OBS_TIMEOUT = 'OBS_TIMEOUT'
 STATUS_PIPELINE_EXCEPTION = 'PIPELINE_EXCEPTION'
@@ -62,6 +65,10 @@ EMERGENCY_STATUS_CODES = frozenset({STATUS_OBS_TIMEOUT, STATUS_PIPELINE_EXCEPTIO
 
 class NonFiniteObservationError(ValueError):
     """观测在 float32 转换后出现非有限值，例如 1e300 溢出成 inf。"""
+
+
+class InvalidObservationError(ValueError):
+    """观测消息违反契约：frame_id 不是 base_link_flu，或四元数模长偏离 1。"""
 
 
 class PolicyRunnerNode(Node):
@@ -78,11 +85,10 @@ class PolicyRunnerNode(Node):
         # 非法参数在启动阶段就抛 ValueError，不留下半启动状态。
         self.declare_parameter('model_path', '')
         self.declare_parameter('allow_fallback', False)
-        # hover_thrust 的 0.58 没有实测依据，仅保持既有行为不变。
-        # 真机前必须按 tau_hover = m*g / T_max 重新标定，当前硬件约为 0.13。
-        # 若标定值低于 min_thrust，兜底推力会被夹到 min_thrust，
-        # 需同步下调 min_thrust。
-        self.declare_parameter('hover_thrust', 0.58)
+        # hover_thrust 的默认值没有实测依据，仅用于 mock/台架。
+        # 真机前必须按 tau_hover = m*g / T_max 标定并显式传入，当前硬件约为 0.13。
+        # 标定值低于 min_thrust 时启动校验会失败，需同步下调 min_thrust。
+        self.declare_parameter('hover_thrust', HOVER_THRUST_DEFAULT)
         self.declare_parameter('max_tilt_rate', 3.0)
         self.declare_parameter('min_thrust', 0.15)
         self.declare_parameter('max_thrust', 0.85)
@@ -99,11 +105,20 @@ class PolicyRunnerNode(Node):
         self.watchdog_timeout = float(self.get_parameter('watchdog_timeout_s').value)
         self._validate_parameters()
 
+        if abs(self.hover_thrust - HOVER_THRUST_DEFAULT) < 1e-9:
+            self.get_logger().warn(
+                f'hover_thrust={HOVER_THRUST_DEFAULT} 为未标定默认值，仅用于 mock/台架，'
+                '禁止直接上真机；真机请按 tau_hover = m*g/T_max 标定后显式传入'
+            )
+
         # 推理引擎句柄，None 表示使用内置基准控制器。
         self.ort_session = None
         self.input_name = None
         self.output_name = None
         self._engine_mode = ENGINE_BASELINE_NO_MODEL
+        # ONNX 依赖按需导入，未指定 model_path 时保持 None。
+        self._np = None
+        self._ort = None
         self._init_policy_engine()
 
         # 流水线状态是安全状态的唯一来源，由 observation_callback 更新。
@@ -195,23 +210,46 @@ class PolicyRunnerNode(Node):
                 f'min_thrust 必须小于 max_thrust，'
                 f'当前为 {self.min_thrust} 与 {self.max_thrust}'
             )
+        if not (self.min_thrust <= self.hover_thrust <= self.max_thrust):
+            # 悬停推力是兜底动作的唯一推力来源，越界必须在启动阶段暴露，
+            # 不能靠 _safe_action 静默夹紧，否则日志值和实际下发值对不上。
+            raise ValueError(
+                f'hover_thrust 必须落在 [min_thrust, max_thrust] 内，'
+                f'当前 hover_thrust={self.hover_thrust}、'
+                f'min_thrust={self.min_thrust}、max_thrust={self.max_thrust}；'
+                '若标定悬停推力低于 min_thrust，请同步下调 min_thrust'
+            )
         if not math.isfinite(self.watchdog_timeout) or not (0.0 < self.watchdog_timeout <= 5.0):
             raise ValueError(
                 f'watchdog_timeout_s 必须位于 (0, 5]，当前为 {self.watchdog_timeout!r}'
             )
 
+    def _import_onnx_runtime(self):
+        """按需导入 numpy/onnxruntime。
+
+        指定了模型却缺少运行库属于部署错误，必须给出可操作的错误信息；
+        未指定模型时完全不导入，避免可选依赖把默认链路拖垮。
+        """
+        try:
+            import numpy as np
+            import onnxruntime as ort
+        except Exception as exc:
+            raise RuntimeError(
+                f'已指定 model_path={self.model_path!r}，'
+                f'但导入 numpy/onnxruntime 失败: {exc}；'
+                '请确认依赖已安装，或先执行 ./docker/build_image.sh '
+                '构建带 onnxruntime 的镜像'
+            ) from exc
+        self._np = np
+        self._ort = ort
+
     def _init_policy_engine(self):
         """初始化推理引擎，按契约严格处理加载失败。"""
         if self.model_path:
-            # 指定了模型却缺少运行库属于部署错误，不能静默降级。
-            if not HAS_ONNX:
-                raise RuntimeError(
-                    f'已指定 model_path={self.model_path!r}，但未安装 numpy/onnxruntime，'
-                    '无法加载模型'
-                )
+            self._import_onnx_runtime()
             self.get_logger().info(f'正在加载 ONNX 模型: {self.model_path}')
             try:
-                self.ort_session = ort.InferenceSession(
+                self.ort_session = self._ort.InferenceSession(
                     self.model_path,
                     providers=['CPUExecutionProvider']
                 )
@@ -231,14 +269,9 @@ class PolicyRunnerNode(Node):
             self._engine_mode = ENGINE_ONNX
             return
 
-        # 未指定模型属于开发模式，保持可运行。
+        # 未指定模型属于开发模式，保持可运行；此时不导入 onnxruntime。
         self._engine_mode = ENGINE_BASELINE_NO_MODEL
-        if not HAS_ONNX:
-            self.get_logger().warn(
-                '当前环境未安装 numpy/onnxruntime，使用内置基准控制器运行。'
-            )
-        else:
-            self.get_logger().info('未指定 model_path，使用内置基准控制器运行。')
+        self.get_logger().info('未指定 model_path，使用内置基准控制器运行。')
 
     @staticmethod
     def _last_dim(shape):
@@ -261,14 +294,21 @@ class PolicyRunnerNode(Node):
         input_shape = list(input_meta.shape)
         output_shape = list(output_meta.shape)
 
-        if len(input_shape) not in (1, 2):
+        # 推理侧固定按 (1, OBS_DIM) 送张量；rank-1 输入会在 run 时因维度不符失败，
+        # 所以必须在加载阶段拒绝，而不是等到每帧推理才发现。
+        if len(input_shape) != 2:
             raise RuntimeError(
-                f'ONNX 输入 rank 必须为 1 或 2，期望 [batch, {OBS_DIM}]，'
+                f'ONNX 输入 rank 必须为 2，期望 [batch, {OBS_DIM}]，'
                 f'实际 {input_shape}'
             )
         if self._last_dim(input_shape) != OBS_DIM:
             raise RuntimeError(
                 f'ONNX 输入形状必须为 [batch, {OBS_DIM}]，实际 {input_shape}'
+            )
+        # 推理侧固定 batch=1；固定 batch 不是 1 的模型只会在 run 时失败。
+        if isinstance(input_shape[0], int) and input_shape[0] != 1:
+            raise RuntimeError(
+                f'ONNX 输入 batch 必须为 1 或动态维，实际 {input_shape}'
             )
         if len(output_shape) not in (1, 2):
             raise RuntimeError(
@@ -278,6 +318,10 @@ class PolicyRunnerNode(Node):
         if self._last_dim(output_shape) != ACTION_DIM:
             raise RuntimeError(
                 f'ONNX 输出形状必须为 [batch, {ACTION_DIM}]，实际 {output_shape}'
+            )
+        if len(output_shape) == 2 and isinstance(output_shape[0], int) and output_shape[0] != 1:
+            raise RuntimeError(
+                f'ONNX 输出 batch 必须为 1 或动态维，实际 {output_shape}'
             )
         input_type = getattr(input_meta, 'type', '未知')
         if input_type != 'tensor(float)':
@@ -296,11 +340,30 @@ class PolicyRunnerNode(Node):
         """17 维观测向量的唯一拼装点，返回 tuple[float, ...]。
 
         冻结顺序: [quat(w,x,y,z), lin_vel(3), ang_vel(3), rel_pos(3), last_action(4)]。
+        先校验 frame_id 与四元数模长，再按字段名取数。
         四元数必须显式按字段名取 w 在前。
         geometry_msgs/Quaternion 的字段顺序是 x, y, z, w，
         按消息下标取会把实部顺序搞错。
         """
+        frame_id = str(obs_msg.header.frame_id)
+        if frame_id != BODY_FRAME_ID:
+            raise InvalidObservationError(
+                f'观测 frame_id 必须为 {BODY_FRAME_ID!r}，实际 {frame_id!r}；'
+                'PX4 的 FRD/NED 数据必须先转换成 FLU/ENU'
+            )
+
         q = obs_msg.orientation
+        q_values = (q.w, q.x, q.y, q.z)
+        # 非有限分量交给 observation_callback 的统一有限性检查；这里只拦截
+        # 有限但模长明显不为 1 的观测（例如默认构造的全零四元数）。
+        if all(math.isfinite(value) for value in q_values):
+            q_norm = math.sqrt(sum(value * value for value in q_values))
+            if abs(q_norm - 1.0) > QUATERNION_NORM_TOLERANCE:
+                raise InvalidObservationError(
+                    f'观测四元数模长必须为 1（容差 {QUATERNION_NORM_TOLERANCE}），'
+                    f'实际 {q_norm!r}'
+                )
+
         lin = obs_msg.body_linear_velocity
         ang = obs_msg.body_angular_velocity
         rel = obs_msg.rel_position_error
@@ -326,18 +389,19 @@ class PolicyRunnerNode(Node):
             return [-0.5 * rel_y, 0.5 * rel_x, 0.0, self.hover_thrust + 0.1 * rel_z]
 
         # 仅在真正调用 ONNX 时才引入 numpy 张量，拼装路径保持纯 Python。
-        model_input = np.asarray(observation, dtype=np.float32).reshape(1, OBS_DIM)
+        model_input = self._np.asarray(
+            observation, dtype=self._np.float32).reshape(1, OBS_DIM)
         # 1e300 转 float32 会静默溢出成 inf，送进网络前必须再查有限性。
-        if not np.isfinite(model_input).all():
+        if not self._np.isfinite(model_input).all():
             raise NonFiniteObservationError(
                 '观测值转 float32 后非有限，已跳过推理并输出悬停兜底动作'
             )
         outputs = self.ort_session.run([self.output_name], {self.input_name: model_input})[0]
-        flat_output = np.asarray(outputs, dtype=np.float32).reshape(-1)
+        flat_output = self._np.asarray(outputs, dtype=self._np.float32).reshape(-1)
         if int(flat_output.size) != ACTION_DIM:
             raise ValueError(
                 f'ONNX 输出形状必须为 [batch, {ACTION_DIM}]，'
-                f'实际 {list(np.shape(outputs))}'
+                f'实际 {list(self._np.shape(outputs))}'
             )
         return [float(flat_output[0]), float(flat_output[1]),
                 float(flat_output[2]), float(flat_output[3])]
@@ -354,8 +418,8 @@ class PolicyRunnerNode(Node):
     def _safe_action(self):
         """悬停兜底动作，推力必须夹进安全包线。
 
-        真机悬停推力可能低于 min_thrust（当前硬件约 0.13，默认下限 0.15），
-        不夹紧就会在兜底时发出越包线推力。
+        hover_thrust 已在启动时校验落在 [min_thrust, max_thrust]，
+        这里的 clamp 是最后防线；正常配置下不会改变数值。
         """
         thrust = self._clamp(float(self.hover_thrust), self.min_thrust, self.max_thrust)
         return (0.0, 0.0, 0.0, thrust)
@@ -417,7 +481,7 @@ class PolicyRunnerNode(Node):
 
         action_msg = PolicyAction()
         action_msg.header.stamp = self.get_clock().now().to_msg()
-        action_msg.header.frame_id = 'base_link_flu'
+        action_msg.header.frame_id = BODY_FRAME_ID
         action_msg.desired_body_rates = Vector3(
             x=float(action[0]), y=float(action[1]), z=float(action[2])
         )
@@ -425,7 +489,7 @@ class PolicyRunnerNode(Node):
         action_msg.raw_action = [float(value) for value in raw_action]
         action_msg.inference_latency_ms = float(inference_ms)
 
-        # 端到端延迟采样点紧贴 publish，不把构造消息的耗时算进去。
+        # 端到端延迟采样点紧贴 publish，只排除 publish 调用本身。
         if obs_msg is None:
             end_to_end_ms = -1.0
         else:
@@ -479,7 +543,13 @@ class PolicyRunnerNode(Node):
         self._step_counter += 1
 
         try:
-            observation = self._build_observation(obs_msg)
+            try:
+                observation = self._build_observation(obs_msg)
+            except InvalidObservationError as exc:
+                # frame_id/四元数模长不符属于契约错误，不能送进网络。
+                self._publish_safe_action(
+                    obs_msg, t_start, STATUS_INVALID_OBSERVATION, str(exc))
+                return
 
             # 非有限观测直接跳过推理: 让模型吃到 NaN 只会产生无意义输出。
             if not all(math.isfinite(value) for value in observation):
@@ -622,8 +692,9 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, ParameterException) as exc:
         # 参数或模型非法: 给出可读信息后退出，不打 traceback。
+        # ParameterException 覆盖 rclpy 的参数类型/重复声明等错误。
         print(f'[policy_runner_node] 启动失败: {exc}', file=sys.stderr)
         raise SystemExit(1)
     finally:

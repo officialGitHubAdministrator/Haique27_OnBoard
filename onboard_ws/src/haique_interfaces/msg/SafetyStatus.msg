@@ -10,11 +10,14 @@ std_msgs/Header header
 bool is_safe
 
 # 是否处于强化学习 Offboard 控制激活状态
-# 所有权属于 px4_rates_bridge: 只有真正向 PX4 发送 setpoint 时才可置 true。
-# policy_runner_node 恒置 false，避免在未接管飞控时谎报已 Offboard。
+# 语义上属于 px4_rates_bridge: 只有真正向 PX4 发送 setpoint 时才可置 true。
+# 但本话题的唯一发布者是 policy_runner_node，且 bridge 目前不发送 setpoint，
+# 因此当前恒为 false。接入 PX4 前需给 bridge 单独开状态话题/服务，或由 policy
+# 订阅 bridge 状态后再填写，不能出现两个发布者。
 bool offboard_enabled
 
-# 是否触发紧急停车/返航/抢权
+# 是否检测到需要上层介入的紧急故障（急停/返航/抢权由上层决定并执行；
+# 当前 policy_runner_node 只下发悬停安全动作，不执行这三种动作）。
 # 仅 "OBS_TIMEOUT" 与 "PIPELINE_EXCEPTION" 两类真故障置 true;
 # 非有限输入与降级模式已输出安全动作，不算紧急。
 # OBS_TIMEOUT 期间 policy_runner_node 会以 20Hz 主动向 /haique/policy_action
@@ -23,6 +26,8 @@ bool offboard_enabled
 bool emergency_triggered
 
 # 状态码或诊断提示 (如 "NORMAL", "WAITING_OBSERVATION", "BASELINE_FALLBACK",
-# "NONFINITE_OBSERVATION", "NONFINITE_ACTION", "OBS_TIMEOUT", "PIPELINE_EXCEPTION")
+# "NONFINITE_OBSERVATION", "INVALID_OBSERVATION", "NONFINITE_ACTION",
+# "OBS_TIMEOUT", "PIPELINE_EXCEPTION")
+# INVALID_OBSERVATION 表示 frame_id 不是 base_link_flu，或四元数模长偏离 1。
 string status_code
 string message

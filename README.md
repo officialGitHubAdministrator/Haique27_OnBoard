@@ -1,75 +1,83 @@
-# 海雀 (Haique) 机载控制工作区
+# 海雀机载控制系统工作区
 
-7 寸四旋翼强化学习项目的机载部分，运行在机载 Linux 计算机上，ROS 2 Humble。
-策略以 50Hz 输出三轴期望角速度与归一化总推力，交给 PX4 的内层角速度环执行；
-神经网络不直接输出电机 PWM。
+7 寸四旋翼强化学习项目的机载部分，ROS 2 Humble，Python 节点，运行在机载 Linux 计算机上。
+策略正常以 50Hz 输出三轴期望角速度和归一化总推力；观测超时期间改为 20Hz 悬停安全动作。
+设计上由 PX4 的内层角速度环执行，不直接输出电机 PWM。
 
-当前能跑通的只有一条 50Hz 模拟数据流水线。没有飞控、没有真实状态估计，
-`px4_rates_bridge` 只做坐标换算，不向 PX4 发送任何 setpoint。
+**当前代码不能用于真机飞行。** 没有 PX4 链路、没有真实状态估计、没有 RC 抢权/围栏/硬急停。
+默认悬停推力 `hover_thrust=0.58` 未标定，真机前必须重新标定。
+`px4_rates_bridge` 只做 FLU 到 FRD 的换算，结果直接丢弃。
 
-## 目录结构
+## 已跑通部分
 
-```text
-DRONE_Workspace/
-├── docs/
-│   ├── DESIGN.md                  # 系统边界、架构、接口契约、参数、已知限制
-│   └── CODE_GUIDE.md              # 带人读代码：ROS 2 概念、逐文件、动手实验
-├── docker/
-│   ├── Dockerfile                 # 自定义镜像配方，含 onnxruntime 与 DDS Agent
-│   ├── build_image.sh             # 构建 haique/ros2-humble:latest
-│   ├── build_workspace.sh         # 在容器里执行 colcon build（文件副本，不是符号链接）
-│   ├── run_mock_loop.sh           # 启动 50Hz 模拟流水线
-│   └── run_desktop_container.sh   # 交互式开发容器，可用 rviz2
-├── onboard_ws/
-│   └── src/
-│       ├── haique_interfaces/     # 消息定义包，CMake + rosidl 构建
-│       └── haique_policy_runner/  # 三个节点，Python 构建
-└── simulation/
-    └── Haique27_RL -> /home/wang/Haique27_RL   # 训练仓库软链接
-```
-
-## 编译与运行
-
-宿主机是 Ubuntu 24.04，ROS 2 Humble 装在容器里（镜像 `osrf/ros:humble-desktop`），编译与运行都在容器内完成。
-
-```bash
-# 编译 onboard_ws（容器内执行 colcon build，结束后修复文件属主）
-./docker/build_workspace.sh
-
-# 启动模拟流水线：mock 观测 + 策略 + 坐标桥，三个节点一起起来，Ctrl+C 停止
-./docker/run_mock_loop.sh
-
-# 进入交互式开发容器（想单独敲 ros2 命令时用）
-./docker/run_desktop_container.sh
-
-# 可选：要跑 ONNX 模型时先构建自定义镜像，再用 HAIQUE_IMAGE 指定
-./docker/build_image.sh
-HAIQUE_IMAGE=haique/ros2-humble:latest ./docker/run_mock_loop.sh
-```
-
-进入容器后先 source 两层环境，再启动：
-
-```bash
-source /opt/ros/humble/setup.bash
-source /root/ros2_ws/install/setup.bash
-ros2 launch haique_policy_runner mock_closed_loop.launch.py
-```
-
-## 当前状态
+唯一跑得通的是零硬件 mock 开环流水线。`mock_telemetry_pub.py` 以 50Hz 发布三角函数观测；
+`policy_runner_node.py` 拼装 17 维观测、推理或使用内置基准控制器、限幅并发布 4 维动作；
+`px4_rates_bridge.py` 订阅动作做坐标换算。观测不随动作变化，闭环不成立；launch 文件名仍叫
+`mock_closed_loop`，名字是历史遗留。
 
 | 能力 | 状态 |
 |---|---|
-| 50Hz 模拟观测发布 | 已实现，数据是三角函数 |
-| 17 维观测拼装、4 维动作发布 | 已实现，顺序与契约一致 |
-| 推力限幅、角速度限幅、参数校验 | 已实现 |
-| 非有限值拦截、看门狗超时下发安全动作 | 已实现 |
-| ONNX 模型加载与推理路径 | 代码路径已实现，仓库环境未验证：默认镜像无 onnxruntime、无 .onnx、未构建自定义镜像 |
-| FLU 到 FRD 角速度换算 | 已实现，换算结果被丢弃 |
-| 向 PX4 发 offboard 心跳与 setpoint | 未实现 |
-| 真实状态估计（PX4 里程计转观测） | 未实现 |
-| 飞机动力学与真实闭环 | 未实现 |
-| 遥控器抢权、安全守卫 | 未实现 |
+| 50Hz mock 观测与 17 维拼装 | 已实现 |
+| 4 维动作、限幅、参数校验、看门狗、状态发布 | 已实现 |
+| FLU 到 FRD 换算 | 已实现（结果被丢弃） |
+| ONNX 模型加载与推理 | 未验证 |
+| PX4 offboard 心跳与 setpoint | 未实现 |
+| 真实状态估计、飞机动力学 | 未实现 |
+| RC 抢权、围栏、硬急停 | 未实现 |
+| 自动化测试 | 无 |
 
-## 文档索引
+ONNX 分支的加载、形状校验和推理代码存在，但默认镜像没有 onnxruntime，仓库也没有 `.onnx` 模型，未验证；自定义镜像见下文。
 
-设计说明见 [docs/DESIGN.md](docs/DESIGN.md)，代码走读见 [docs/CODE_GUIDE.md](docs/CODE_GUIDE.md)，训练仓库在 `/home/wang/Haique27_RL`。
+## 构建与运行
+
+开发环境是 Ubuntu 24.04 宿主机 + Docker 容器。ROS 2 Humble 在容器里，默认镜像
+`osrf/ros:humble-desktop`，编译和运行都在容器内完成。
+
+```bash
+./docker/build_workspace.sh        # 容器内 colcon build，结束后修复生成文件属主
+./docker/run_mock_loop.sh          # mock 观测 + 策略 + 坐标桥，Ctrl+C 停止
+./docker/run_desktop_container.sh  # 交互式开发容器，可执行 ros2 命令或开 rviz2
+```
+
+ONNX 推理需要带 onnxruntime 的自定义镜像，并在启动时显式传入模型路径：
+
+```bash
+./docker/build_image.sh
+HAIQUE_IMAGE=haique/ros2-humble:latest ./docker/run_desktop_container.sh
+# 容器内
+source /opt/ros/humble/setup.bash && source /root/ros2_ws/install/setup.bash
+ros2 launch haique_policy_runner mock_closed_loop.launch.py \
+  model_path:=/root/ros2_ws/models/policy.onnx
+```
+
+模型放在宿主机的 `onboard_ws/models/`，对应容器内的 `/root/ros2_ws/models/`；模型文件不入库。
+`run_mock_loop.sh` 不转发 launch 参数，所以要像上面这样手动 `ros2 launch`。`run_desktop_container.sh`
+会复用已有的 `haique_ros2_humble` 容器；如果它是用默认镜像建的，先 `docker rm -f haique_ros2_humble`
+删掉，再启动才会用上自定义镜像。
+
+## 验证
+
+仓库没有自动化测试，也没有 CI。手动回归是三项：编译通过、启动 mock 流水线、另开一个容器确认观测约 50Hz
+且安全状态为 `NORMAL`。推荐在 `run_desktop_container.sh` 进入的同一个开发容器里启动和检查；`run_mock_loop.sh`
+使用独立 IPC 命名空间，跨容器订阅可能收不到数据。命令见 [CONTRIBUTING.md](CONTRIBUTING.md) 的“本地验证”。
+
+## 目录
+
+```text
+DRONE_Workspace/
+├── CONTRIBUTING.md            # 团队协作流程与评审规则
+├── docs/{DESIGN.md,CODE_GUIDE.md}
+├── docker/                    # 镜像构建、工作区编译、运行脚本
+└── onboard_ws/src/
+    ├── haique_interfaces/     # 三个 .msg，ament_cmake + rosidl
+    └── haique_policy_runner/  # 三个节点，ament_python
+```
+
+## 文档
+
+先读 [docs/DESIGN.md](docs/DESIGN.md) 了解系统边界和接口契约，再读
+[docs/CODE_GUIDE.md](docs/CODE_GUIDE.md) 逐文件看代码。提 PR 前读
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
+训练仓库单独维护，不在本仓库内；跨仓库接口以其 `docs/INTERFACE_CONTRACT.md` 为基准，当前为 v4，
+已与本仓库实现对齐。再改接口时两边同步修改，见 [docs/DESIGN.md](docs/DESIGN.md) 开头的约定。
